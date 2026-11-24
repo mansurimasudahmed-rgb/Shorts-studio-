@@ -1,7 +1,8 @@
-import json, os, sys, urllib.request
+import json, os, sys, urllib.request, urllib.error
 
-key = os.environ["GEMINI_API_KEY"]
-model = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
+key = os.environ["GEMINI_API_KEY"].strip()
+model = os.environ.get("GEMINI_MODEL", "gemini-flash-latest").strip()
+print("Key length:", len(key), "| Model:", model)
 
 prompt = """You are the Researcher for a faceless YouTube Shorts channel about
 mysteries and history. Pick ONE lesser-known but well-documented topic that
@@ -22,6 +23,9 @@ req = urllib.request.Request(
 try:
     data = json.load(urllib.request.urlopen(req, timeout=60))
     topic = json.loads(data["candidates"][0]["content"]["parts"][0]["text"])
+except urllib.error.HTTPError as e:
+    print("Researcher failed:", e.code, e.read().decode()[:600])
+    sys.exit(1)
 except Exception as e:
     print("Researcher failed:", e)
     sys.exit(1)
