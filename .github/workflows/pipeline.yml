@@ -20,7 +20,7 @@ jobs:
         run: |
           pip install edge-tts mutagen pillow
           sudo apt-get update -qq
-          sudo apt-get install -y -qq fonts-dejavu-core
+          sudo apt-get install -y -qq ffmpeg fonts-dejavu-core
       - name: Agent 1, Researcher
         run: python agents/researcher.py
       - name: Agent 2, Writer
