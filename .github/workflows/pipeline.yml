@@ -1,35 +1,511 @@
-name: Pipeline
-on:
-  workflow_dispatch:
-    inputs:
-      model:
-        description: Gemini model ID from AI Studio
-        default: gemini-flash-latest
-jobs:
-  run:
-    runs-on: ubuntu-latest
-    env:
-      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-      GEMINI_MODEL: ${{ inputs.model }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - name: Install tools
-        run: |
-          pip install edge-tts mutagen pillow
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg fonts-dejavu-core
-      - name: Agent 1, Researcher
-        run: python agents/researcher.py
-      - name: Agent 2, Writer
-        run: python agents/writer.py
-      - name: Agent 3, Producer
-        run: python agents/producer.py
-      - name: Agent 4, Editor
-        run: python agents/editor.py
-      - uses: actions/upload-artifact@v4
-        with:
-          name: output
-          path: output/
+"""
+Shorts Factory: 5-agent pipeline (Researcher -> Writer -> Voice -> Visuals -> Editor).
+Runs on GitHub Actions. Stops at a finished mp4 for human approval (no auto-upload).
+Every agent step is logged to out/events.jsonl (and POSTed to DASHBOARD_URL if set),
+so the live dashboard can plug in later.
+"""
+import asyncio, base64, io, json, os, pathlib, random, re, subprocess, time
+
+import edge_tts
+import requests
+import numpy as np
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter
+
+OUT = pathlib.Path("out")
+OUT.mkdir(exist_ok=True)
+W, H, FPS = 1080, 1920, 30
+
+GEMINI_KEY = os.environ["GEMINI_API_KEY"]
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+CF_ACCOUNT = os.environ.get("CF_ACCOUNT_ID", "")
+CF_TOKEN = os.environ.get("CF_API_TOKEN", "")
+VOICE = os.environ.get("TTS_VOICE", "en-US-GuyNeural")
+DASHBOARD_URL = os.environ.get("DASHBOARD_URL", "")
+DASHBOARD_TOKEN = os.environ.get("DASHBOARD_TOKEN", "")
+FORCED_TOPIC = os.environ.get("TOPIC", "").strip()
+
+STYLE = ("stylized 3D animated-film render, soft blurred background with shallow depth of field, "
+         "deep blue gradient sky with puffy cream clouds, warm orange wood or sand ground in the lower third, "
+         "glossy props, strong warm and cool color contrast, saturated colors, vertical composition, "
+         "empty of people, no text")
+
+CHAR_STYLE = ("2D cartoon stick-figure characters with round white egg-shaped heads, dark navy outlines, thin noodle arms and legs, "
+              "small dark hands, heavy-lidded half-closed eyes, arched eyebrows, confident smirk, simple painted-on costume "
+              "(top hat with polka-dot bowtie, or crown with long cape, or cowboy hat with poncho), characters centered in frame, "
+              "standing in a painterly semi-3D rendered scene with glossy 3D props, soft gradients, blurred depth of field, "
+              "deep blue gradient sky with puffy cream clouds, warm orange wood and sand, strong warm and cool color contrast, "
+              "soft blue cast shadows, vertical composition, no text, no captions")
+SCENE_MODE = os.environ.get("SCENE_MODE", "ai")  # "ai" = AI draws whole scene, "drawn" = code-drawn characters
+
+
+# ---------- helpers ----------
+def emit(agent, msg, status="working", data=None):
+    ev = {"t": time.time(), "agent": agent, "status": status, "msg": msg, "data": data}
+    print(f"[{agent}] {status}: {msg}", flush=True)
+    with open(OUT / "events.jsonl", "a") as f:
+        f.write(json.dumps(ev) + "\n")
+    if DASHBOARD_URL:
+        try:
+            requests.post(DASHBOARD_URL, json=ev, timeout=5,
+                          headers={"Authorization": f"Bearer {DASHBOARD_TOKEN}"})
+        except Exception:
+            pass
+
+
+def gemini_json(prompt):
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+    body = {"contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"responseMimeType": "application/json", "temperature": 0.9}}
+    for attempt in range(3):
+        r = requests.post(url, params={"key": GEMINI_KEY}, json=body, timeout=90)
+        if r.status_code == 429:
+            time.sleep(20 * (attempt + 1))
+            continue
+        r.raise_for_status()
+        text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+        return json.loads(text)
+    raise RuntimeError("Gemini rate-limited 3 times")
+
+
+def run(cmd):
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+
+def duration(path):
+    r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                        "-of", "csv=p=0", str(path)], capture_output=True, text=True, check=True)
+    return float(r.stdout.strip())
+
+
+# ---------- Agent 1: Researcher ----------
+def researcher():
+    emit("Researcher", "Looking for a surprising true story")
+    if FORCED_TOPIC:
+        emit("Researcher", f"Using your topic: {FORCED_TOPIC}", "done")
+        return {"topic": FORCED_TOPIC, "key_facts": []}
+    used = pathlib.Path("used_topics.txt")
+    used_list = used.read_text().splitlines() if used.exists() else []
+    res = gemini_json(
+        "You research topics for a faceless YouTube Shorts channel about MYSTERIES and HISTORY. "
+        "Brainstorm 6 surprising, well-documented true stories with a strong curiosity hook "
+        "(example styles: 'How a Mirror Rigged a Horse Race', 'Why the Second Draw Always Wins'). "
+        f"Do NOT repeat any of these: {used_list[-40:]}. "
+        "Pick the single best one. Use only widely documented facts; if something is disputed, say so. "
+        'Return JSON: {"topic": str, "hook_title": str, "key_facts": [5-7 short factual strings], '
+        '"confidence_note": str}')
+    with open(used, "a") as f:
+        f.write(res["topic"] + "\n")
+    emit("Researcher", f"Picked: {res['topic']}", "done", res)
+    return res
+
+
+# ---------- Agent 2: Scriptwriter ----------
+def writer(research):
+    emit("Scriptwriter", "Writing a sub-60s script")
+    res = gemini_json(
+        "Write a YouTube Short script (under 55 seconds spoken: 110-130 words TOTAL) in the Mysteries/History niche. "
+        f"Topic: {research['topic']}. Facts to use: {research.get('key_facts')}. "
+        "Rules: first line is a curiosity hook; last line is a twist or open question; short punchy sentences; "
+        "no invented quotes or statistics. Split into 8-10 'lines', each one scene. "
+        "Each scene features 1 or 2 egg-head stick-figure characters. "
+        'Return JSON: {"title": str, "description": str, "lines": [{"text": str, '
+        '"scene_prompt": "one vivid sentence describing the whole scene: the 1-2 stick-figure characters (costume, expression, pose, props) and the setting", '
+        '"bg_prompt": "describe ONLY the empty background setting", '
+        '"chars": [{"side": "left|right|center", "costume": "tophat|crown|cowboy|none", '
+        '"color": "red|teal|green|orange|blue|purple", "mood": "smirk|angry|shock|happy"}]}]}')
+    words = sum(len(l["text"].split()) for l in res["lines"])
+    emit("Scriptwriter", f"Script ready: {len(res['lines'])} scenes, {words} words", "done", res)
+    return res
+
+
+# ---------- Agent 3: Voice ----------
+async def _tts_line(text, path):
+    comm = edge_tts.Communicate(text, VOICE, rate="+8%", boundary="WordBoundary")
+    words = []
+    with open(path, "wb") as f:
+        async for ch in comm.stream():
+            if ch["type"] == "audio":
+                f.write(ch["data"])
+            elif ch["type"] == "WordBoundary":
+                words.append({"w": ch["text"], "start": ch["offset"] / 1e7,
+                              "end": (ch["offset"] + ch["duration"]) / 1e7})
+    return words
+
+
+def voice(script):
+    emit("Voice", "Recording narration line by line")
+    timings, t0 = [], 0.0
+    for i, line in enumerate(script["lines"]):
+        p = OUT / f"line{i}.mp3"
+        words = asyncio.run(_tts_line(line["text"], p))
+        d = duration(p)
+        line["dur"] = d + 0.15
+        line["audio"] = str(p)
+        for w in words:
+            timings.append({"w": w["w"], "start": t0 + w["start"], "end": t0 + w["end"]})
+        t0 += line["dur"]
+        emit("Voice", f"Line {i+1}/{len(script['lines'])} done ({d:.1f}s)")
+    emit("Voice", f"Narration total {t0:.1f}s", "done")
+    return timings
+
+
+# ---------- Agent 4: Visuals ----------
+COLORS = {"red": (214, 40, 57), "teal": (32, 178, 160), "green": (90, 200, 160),
+          "orange": (235, 140, 40), "blue": (60, 110, 220), "purple": (140, 80, 200)}
+INK = (28, 20, 40)
+
+
+def _shade(layer, fn, base, dark=0.62, k_hi=0.5, tint=(0, 6, 22)):
+    """Fill a shape with a light-from-top-left gradient (the soft 3D look)."""
+    mask = Image.new("L", layer.size, 0)
+    fn(ImageDraw.Draw(mask), 255, None, 0)
+    box = mask.getbbox()
+    if not box:
+        return
+    x0, y0, x1, y1 = box
+    w, h = x1 - x0, y1 - y0
+    yy, xx = np.mgrid[0:h, 0:w]
+    t = np.clip(np.sqrt(((xx - 0.30 * w) / w) ** 2 + ((yy - 0.28 * h) / h) ** 2) / 0.9, 0, 1)[..., None]
+    b = np.array(base, dtype=float)
+    light = b + (255 - b) * k_hi
+    shade = b * dark + np.array(tint)
+    arr = (light * (1 - t) + shade * t).clip(0, 255).astype("uint8")
+    layer.paste(Image.fromarray(arr, "RGB"), (x0, y0), mask.crop(box))
+
+
+def _part(layer, fn, base, lw, **kw):
+    _shade(layer, fn, base, **kw)
+    fn(ImageDraw.Draw(layer), None, INK, max(2, int(lw)))  # outline on top
+
+
+def _ellipse(box):
+    def f(d, fill, outline, w):
+        d.ellipse(box, fill=fill) if fill is not None else d.ellipse(box, outline=outline, width=w)
+    return f
+
+
+def _rrect(box, r):
+    def f(d, fill, outline, w):
+        if fill is not None:
+            d.rounded_rectangle(box, radius=r, fill=fill)
+        else:
+            d.rounded_rectangle(box, radius=r, outline=outline, width=w)
+    return f
+
+
+def _poly(pts):
+    def f(d, fill, outline, w):
+        if fill is not None:
+            d.polygon(pts, fill=fill)
+        else:
+            d.line(pts + [pts[0]], fill=outline, width=w, joint="curve")
+            for p in pts:
+                d.ellipse([p[0] - w / 2, p[1] - w / 2, p[0] + w / 2, p[1] + w / 2], fill=outline)
+    return f
+
+
+def _noodle(d, pts, w):
+    d.line(pts, fill=INK, width=int(w), joint="curve")
+    for p in pts:
+        d.ellipse([p[0] - w / 2, p[1] - w / 2, p[0] + w / 2, p[1] + w / 2], fill=INK)
+
+
+def _put(img, layer, x, y):
+    try:
+        img.alpha_composite(layer, (int(x), int(y)))
+    except ValueError:
+        img.paste(layer, (int(x), int(y)), layer)
+
+
+def draw_char(img, cx, base_y, costume, color, mood, s=1.5, outfit=None):
+    """Egg-head stick figure: flat 2D shapes, soft 3D shading, thin dark outlines, painted-on clothes."""
+    SS = 2
+    k = s * SS
+    LW, LH = 780 * SS, 1400 * SS
+    layer = Image.new("RGBA", (LW, LH), (0, 0, 0, 0))
+    d = ImageDraw.Draw(layer, "RGBA")
+    ox, oy = LW // 2, LH - 110 * SS
+    lw = 4.2 * k
+    base = COLORS.get(color, COLORS["red"])
+    outfit = outfit or {"tophat": "bowtie", "cowboy": "poncho", "crown": "robe"}.get(costume, "none")
+    body_w, body_h = 158 * k, 205 * k
+    half = body_w / 2
+    leg_top = oy - 205 * k
+    body_top = leg_top - body_h
+    hrx, hry = 130 * k, 120 * k
+    hcy = body_top - hry + 40 * k
+
+    # thin noodle legs with L-shaped feet
+    for sx in (-1, 1):
+        _noodle(d, [(ox + sx * 36 * k, leg_top - 10 * k), (ox + sx * 40 * k, oy - 12 * k),
+                    (ox + sx * 76 * k, oy)], lw)
+    # thin bent arms behind the body (shock/happy raise them)
+    up = {"shock": (-1, 1), "happy": (1,)}.get(mood, ())
+    hands = []
+    for sx in (-1, 1):
+        sh = (ox + sx * (half - 8 * k), body_top + 48 * k)
+        if sx in up:
+            el, hd = (ox + sx * (half + 78 * k), body_top + 40 * k), (ox + sx * (half + 70 * k), body_top - 70 * k)
+        else:
+            el, hd = (ox + sx * (half + 48 * k), body_top + 125 * k), (ox + sx * (half + 30 * k), body_top + 195 * k)
+        _noodle(d, [sh, el, hd], lw)
+        hands.append(hd)
+
+    # body / robe
+    if outfit == "robe":
+        pts = [(ox - half + 22 * k, body_top + 12 * k), (ox + half - 22 * k, body_top + 12 * k),
+               (ox + half - 2 * k, body_top + 50 * k), (ox + half + 62 * k, oy - 16 * k),
+               (ox - half - 62 * k, oy - 16 * k), (ox - half + 2 * k, body_top + 50 * k)]
+        _part(layer, _poly(pts), base, lw, dark=0.55)
+        d.line([(ox - half - 62 * k, oy - 22 * k), (ox + half + 62 * k, oy - 22 * k)], fill=(246, 196, 44), width=int(lw * 2))
+        for sx in (-1, 1):
+            d.line([(ox + sx * 24 * k, body_top + 70 * k), (ox + sx * 52 * k, oy - 30 * k)], fill=(0, 0, 0, 55), width=int(lw))
+    else:
+        _part(layer, _rrect([ox - half, body_top, ox + half, leg_top], int(66 * k)), base, lw, dark=0.58)
+        d.rounded_rectangle([ox - half + 22 * k, body_top + 36 * k, ox - half + 38 * k, body_top + body_h * 0.62],
+                            radius=int(8 * k), fill=(255, 255, 255, 115))
+    # painted-on clothing
+    if outfit == "bowtie":
+        y0 = body_top + 40 * k
+        for sx in (-1, 1):
+            wing = [(ox + sx * 6 * k, y0), (ox + sx * 60 * k, y0 - 28 * k), (ox + sx * 60 * k, y0 + 28 * k)]
+            _part(layer, _poly(wing), (225, 45, 55), lw * 0.7, dark=0.7)
+            for dx, dy in ((26, -8), (40, 8), (46, -10), (30, 10)):
+                d.ellipse([ox + sx * dx * k - 5 * k, y0 + dy * k - 5 * k, ox + sx * dx * k + 5 * k, y0 + dy * k + 5 * k], fill=(255, 255, 255))
+        _part(layer, _ellipse([ox - 14 * k, y0 - 16 * k, ox + 14 * k, y0 + 16 * k]), (170, 25, 40), lw * 0.6)
+    elif outfit == "poncho":
+        acc = tuple(int(c * 0.72) for c in base)
+        xs = np.linspace(-half + 6 * k, half - 6 * k, 9)
+        zig = [(ox + x, body_top + 62 * k + (18 * k if i % 2 else 0)) for i, x in enumerate(xs)]
+        top = [(ox + xs[0], body_top + 16 * k)]
+        col = top + zig + [(ox + xs[-1], body_top + 16 * k)]
+        _part(layer, _poly(col), acc, lw * 0.7, dark=0.75)
+        for i, (x, y) in enumerate(zig):
+            if i % 2 == 0:
+                d.line([(x, y - 4 * k), (x, y - 22 * k)], fill=(255, 255, 255, 220), width=int(lw * 0.8))
+        by = body_top + body_h - 66 * k
+        _part(layer, _rrect([ox - half, by, ox + half, by + 26 * k], int(8 * k)), (62, 44, 44), lw * 0.6, dark=0.6)
+        for x in np.arange(-half + 12 * k, half - 8 * k, 17 * k):
+            d.ellipse([ox + x - 4 * k, by + 9 * k, ox + x + 4 * k, by + 17 * k], fill=(245, 195, 60))
+
+    # small dark hands
+    for hx, hy in hands:
+        d.ellipse([hx - 17 * k, hy - 17 * k, hx + 17 * k, hy + 17 * k], fill=INK)
+
+    # head: cream egg, rim light on the left, glossy spot
+    _part(layer, _ellipse([ox - hrx, hcy - hry, ox + hrx, hcy + hry]), (252, 248, 236), lw, dark=0.8, k_hi=0.0)
+    d.arc([ox - hrx + 9 * k, hcy - hry + 9 * k, ox + hrx - 9 * k, hcy + hry - 9 * k], 118, 238,
+          fill=(255, 226, 150, 215), width=int(7 * k))
+    d.ellipse([ox - hrx * .55, hcy - hry * .74, ox - hrx * .26, hcy - hry * .5], fill=(255, 255, 255, 190))
+
+    # face
+    fc, ey, ex, er, b = ox + 8 * k, hcy + 6 * k, 46 * k, 10 * k, 34 * k
+    bw = int(lw * 1.4)
+    if mood == "shock":
+        for sx in (-1, 1):
+            x = fc + sx * ex
+            d.ellipse([x - 19 * k, ey - 22 * k, x + 19 * k, ey + 22 * k], fill=(255, 255, 255), outline=INK, width=int(lw))
+            d.ellipse([x - 6 * k, ey - 6 * k, x + 6 * k, ey + 10 * k], fill=INK)
+            d.arc([x - b * .8, ey - b * 2.5, x + b * .8, ey - b * 1.2], 205, 335, fill=INK, width=bw)
+    elif mood == "happy":
+        for sx in (-1, 1):
+            x = fc + sx * ex
+            d.arc([x - er * 1.8, ey - er * 1.6, x + er * 1.8, ey + er * 1.2], 200, 340, fill=INK, width=bw)
+            d.arc([x - b * .8, ey - b * 2.5, x + b * .8, ey - b * 1.2], 205, 335, fill=INK, width=bw)
+    else:
+        for sx in (-1, 1):
+            x = fc + sx * ex
+            if mood == "angry":
+                d.line([(x + sx * er * 1.7, ey - er * 1.6), (x - sx * er * 1.7, ey - er * 0.1)], fill=INK, width=int(bw * 1.2))
+                d.line([(x + sx * b * .9, ey - b * 1.9), (x - sx * b * .9, ey - b * 1.0)], fill=INK, width=int(bw * 1.3))
+            else:  # smirk: flat heavy lid, one brow raised
+                d.line([(x - er * 1.7, ey - er * .5), (x + er * 1.7, ey - er * .5)], fill=INK, width=int(bw * 1.2))
+                lift = 0.7 if sx > 0 else 0.0
+                d.arc([x - b * .8, ey - b * (2.4 + lift), x + b * .8, ey - b * (1.1 + lift)], 205, 335, fill=INK, width=bw)
+            d.ellipse([x - er * .8, ey - er * .4, x + er * .8, ey + er * 1.4], fill=INK)
+    my = hcy + 64 * k
+    if mood == "shock":
+        d.ellipse([fc - 16 * k, my - 12 * k, fc + 16 * k, my + 28 * k], fill=INK)
+    elif mood == "angry":
+        d.arc([fc - 40 * k, my - 4 * k, fc + 40 * k, my + 36 * k], 200, 340, fill=INK, width=bw)
+    elif mood == "happy":
+        d.chord([fc - 42 * k, my - 24 * k, fc + 42 * k, my + 30 * k], 10, 170, fill=INK)
+    else:
+        d.arc([fc - 8 * k, my - 22 * k, fc + 68 * k, my + 14 * k], 15, 150, fill=INK, width=bw)
+        d.line([(fc + 62 * k, my - 4 * k), (fc + 72 * k, my - 14 * k)], fill=INK, width=int(lw))
+
+    # hats
+    top = hcy - hry + 14 * k
+    if costume == "tophat":  # cream boater with brown band
+        _part(layer, _rrect([ox - 78 * k, top - 62 * k, ox + 78 * k, top + 10 * k], int(14 * k)), (238, 220, 168), lw, dark=0.75)
+        d.rectangle([ox - 76 * k, top - 22 * k, ox + 76 * k, top - 2 * k], fill=(112, 72, 42))
+        _part(layer, _ellipse([ox - 112 * k, top - 8 * k, ox + 112 * k, top + 26 * k]), (240, 224, 176), lw, dark=0.75)
+    elif costume == "crown":
+        pts = [(ox - 84 * k, top + 16 * k), (ox - 92 * k, top - 76 * k), (ox - 44 * k, top - 26 * k),
+               (ox, top - 92 * k), (ox + 44 * k, top - 26 * k), (ox + 92 * k, top - 76 * k), (ox + 84 * k, top + 16 * k)]
+        _part(layer, _poly(pts), (246, 196, 44), lw, dark=0.7)
+        for x in (-50, 0, 50):
+            d.ellipse([ox + x * k - 7 * k, top - 8 * k, ox + x * k + 7 * k, top + 6 * k], fill=(210, 40, 60))
+    elif costume == "cowboy":  # dark navy, wide thin brim, gold band
+        _part(layer, _rrect([ox - 74 * k, top - 92 * k, ox + 74 * k, top + 8 * k], int(32 * k)), (44, 44, 84), lw, dark=0.6)
+        d.line([(ox - 72 * k, top - 14 * k), (ox + 72 * k, top - 14 * k)], fill=(240, 200, 70), width=int(lw * 1.3))
+        _part(layer, _ellipse([ox - 176 * k, top - 8 * k, ox + 176 * k, top + 32 * k]), (44, 44, 84), lw, dark=0.6)
+
+    layer = layer.resize((LW // SS, LH // SS), Image.LANCZOS)
+    # cast shadow: blurred blue silhouette stretched along the ground
+    Bz = LH // SS - 110
+    sa = layer.split()[3].point(lambda a: int(a * 0.30))
+    sh = Image.new("RGBA", layer.size, (25, 40, 110, 0))
+    sh.putalpha(sa)
+    sh = sh.transform((layer.width + 420, layer.height), Image.AFFINE,
+                      (1, 2.9 * 0.30, -2.9 * 0.30 * Bz, 0, 2.9, -1.9 * Bz), resample=Image.BICUBIC)
+    sh = sh.filter(ImageFilter.GaussianBlur(14))
+    lx, ly = cx - layer.width // 2, base_y - Bz
+    _put(img, sh, lx, ly)
+    _put(img, layer, lx, ly)
+
+
+def _fallback_bg():
+    """Offline backdrop: deep-blue sky, cream clouds, warm wood/sand ground, soft blur."""
+    img = Image.new("RGB", (W, H))
+    px = ImageDraw.Draw(img)
+    hz = int(H * 0.60)
+    for y in range(H):
+        if y < hz:
+            k = (y / hz) ** 0.8
+            c = (int(28 + 95 * k), int(70 + 120 * k), int(185 + 70 * k))
+        else:
+            k = (y - hz) / (H - hz)
+            c = (int(226 - 70 * k), int(150 - 55 * k), int(84 - 30 * k))
+        px.line([(0, y), (W, y)], fill=c)
+    clouds = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    cd = ImageDraw.Draw(clouds)
+    for cxn, cyn, sz in ((0.15, 0.50, 1.0), (0.78, 0.46, 1.2), (0.45, 0.22, 0.8)):
+        for dx, dy, r in ((-90, 10, 80), (-30, -25, 100), (40, -10, 95), (100, 15, 75), (0, 30, 90)):
+            x, y, r = W * cxn + dx * sz, H * cyn + dy * sz, r * sz
+            cd.ellipse([x - r, y - r * .7, x + r, y + r * .7], fill=(255, 246, 228, 235))
+    img = Image.alpha_composite(img.convert("RGBA"), clouds.filter(ImageFilter.GaussianBlur(6))).convert("RGB")
+    return img.filter(ImageFilter.GaussianBlur(3))
+
+
+def _finish_bg(img):
+    """Depth-of-field blur, richer colour and a soft vignette so characters pop."""
+    img = img.filter(ImageFilter.GaussianBlur(2.5))
+    img = ImageEnhance.Color(img).enhance(1.25)
+    yy, xx = np.mgrid[0:H, 0:W]
+    v = 1 - 0.28 * np.clip(np.sqrt(((xx - W / 2) / (W / 2)) ** 2 + ((yy - H / 2) / (H / 2)) ** 2) - 0.5, 0, 1)
+    arr = (np.asarray(img, dtype=float) * v[..., None]).clip(0, 255).astype("uint8")
+    return Image.fromarray(arr)
+
+
+def background(prompt, path, finish=True, full_prompt=None):
+    """Workers AI Flux; falls back to a painted sky/ground so the pipeline never dies."""
+    if CF_ACCOUNT and CF_TOKEN:
+        try:
+            r = requests.post(
+                f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT}/ai/run/@cf/black-forest-labs/flux-1-schnell",
+                headers={"Authorization": f"Bearer {CF_TOKEN}"},
+                json={"prompt": full_prompt or f"{prompt}, {STYLE}", "steps": 6}, timeout=90)
+            r.raise_for_status()
+            img = Image.open(io.BytesIO(base64.b64decode(r.json()["result"]["image"]))).convert("RGB")
+            scale = max(W / img.width, H / img.height)  # cover-crop to 9:16
+            img = img.resize((int(img.width * scale) + 1, int(img.height * scale) + 1))
+            l, t = (img.width - W) // 2, (img.height - H) // 2
+            img = img.crop((l, t, l + W, t + H))
+            (_finish_bg(img) if finish else img).save(path)
+            return True
+        except Exception as e:
+            emit("Visuals", f"Image gen failed, using painted backdrop ({e})", "warn")
+    _finish_bg(_fallback_bg()).save(path)
+    return False
+
+
+def visuals(script):
+    emit("Visuals", "Painting backgrounds and posing characters")
+    for i, line in enumerate(script["lines"]):
+        p = OUT / f"scene{i}.png"
+        if SCENE_MODE == "ai" and line.get("scene_prompt") and background(
+                line["bg_prompt"], p, finish=False, full_prompt=f"{line['scene_prompt']}, {CHAR_STYLE}"):
+            line["image"] = str(p)
+            emit("Visuals", f"Scene {i+1}/{len(script['lines'])} painted by AI")
+            time.sleep(1)
+            continue
+        background(line["bg_prompt"], p)
+        img = Image.open(p).convert("RGBA")
+        chars = line.get("chars") or [{"side": "center", "costume": "none", "color": "red", "mood": "smirk"}]
+        xs = {"left": W * 0.24, "right": W * 0.76, "center": W * 0.5}
+        for c in chars[:2]:
+            draw_char(img, int(xs.get(c.get("side"), W * 0.5)), 1420,
+                      c.get("costume", "none"), c.get("color", "red"), c.get("mood", "smirk"),
+                      outfit=c.get("outfit"))
+        img.convert("RGB").save(p)
+        line["image"] = str(p)
+        emit("Visuals", f"Scene {i+1}/{len(script['lines'])} done")
+        time.sleep(1)
+    emit("Visuals", "All scenes ready", "done")
+
+
+# ---------- Agent 5: Editor ----------
+def ass_time(t):
+    return f"{int(t // 3600)}:{int(t % 3600 // 60):02d}:{t % 60:05.2f}"
+
+
+def make_captions(timings, path):
+    head = ("[Script Info]\nScriptType: v4.00+\nPlayResX: 1080\nPlayResY: 1920\n\n[V4+ Styles]\n"
+            "Format: Name,Fontname,Fontsize,PrimaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,"
+            "ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding\n"
+            "Style: Default,DejaVu Sans,128,&H00FFFFFF,&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,14,0,2,40,40,500,1\n\n"
+            "[Events]\nFormat: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text\n")
+    events = []
+    for i in range(0, len(timings), 1):  # one word at a time, like the reference videos
+        chunk = timings[i:i + 1]
+        end = timings[i + 1]["start"] if i + 1 < len(timings) else chunk[-1]["end"] + 0.2
+        text = "{\\fscx80\\fscy80\\t(0,90,\\fscx106\\fscy106)\\t(90,160,\\fscx100\\fscy100)}" + " ".join(w["w"] for w in chunk).upper().replace("\\", "")
+        events.append(f"Dialogue: 0,{ass_time(chunk[0]['start'])},{ass_time(end)},Default,,0,0,0,,{text}")
+    path.write_text(head + "\n".join(events))
+
+
+def editor(script, timings):
+    emit("Editor", "Animating scenes and burning captions")
+    clips = []
+    for i, line in enumerate(script["lines"]):
+        frames = int(line["dur"] * FPS)
+        clip = OUT / f"clip{i}.mp4"
+        run(["ffmpeg", "-y", "-i", line["image"], "-vf",
+             f"zoompan=z='min(zoom+0.0008,1.2)':d={frames}:s={W}x{H}:fps={FPS},format=yuv420p",
+             "-frames:v", str(frames), "-c:v", "libx264", "-preset", "veryfast", str(clip)])
+        clips.append(clip)
+    (OUT / "videos.txt").write_text("".join(f"file '{c.name}'\n" for c in clips))
+    (OUT / "audios.txt").write_text("".join(f"file '{pathlib.Path(l['audio']).name}'\n" for l in script["lines"]))
+    run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(OUT / "videos.txt"), "-c", "copy", str(OUT / "video.mp4")])
+    run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(OUT / "audios.txt"),
+         "-c:a", "libmp3lame", str(OUT / "audio.mp3")])
+    make_captions(timings, OUT / "captions.ass")
+    run(["ffmpeg", "-y", "-i", str(OUT / "video.mp4"), "-i", str(OUT / "audio.mp3"),
+         "-vf", f"ass={OUT / 'captions.ass'}", "-c:v", "libx264", "-preset", "veryfast",
+         "-c:a", "aac", "-shortest", str(OUT / "short.mp4")])
+    total = duration(OUT / "short.mp4")
+    if total >= 60:
+        emit("Editor", f"WARNING: {total:.1f}s is over 60s, not Shorts-eligible", "warn")
+    emit("Editor", f"Finished video: {total:.1f}s", "done")
+    return total
+
+
+def main():
+    research = researcher()
+    script = writer(research)
+    timings = voice(script)
+    visuals(script)
+    total = editor(script, timings)
+    notes = (f"# {script['title']}\n\n{script['description']}\n\nLength: {total:.1f}s\n\n"
+             f"## Fact-check before posting\nTopic: {research['topic']}\n"
+             + "\n".join(f"- {f}" for f in research.get("key_facts", []))
+             + f"\n\n{research.get('confidence_note', '')}\n\n## Narration\n"
+             + "\n".join(l["text"] for l in script["lines"]))
+    (OUT / "notes.md").write_text(notes)
+    (OUT / "meta.json").write_text(json.dumps({"research": research, "script": script}, indent=2))
+    emit("Human Handoff", "Video ready for your review. Nothing has been published.", "waiting")
+
+
+if __name__ == "__main__":
+    main()
